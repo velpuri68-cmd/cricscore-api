@@ -1,12 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-import json
+from bs4 import BeautifulSoup
 import re
 from datetime import datetime
-from bs4 import BeautifulSoup
 
-app = FastAPI(title="CricScore API", version="3.0.0")
+app = FastAPI(title="CricScore API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,27 +14,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Headers ───────────────────────────────────────────────────────────
+# ── Use Cricbuzz MOBILE site — simpler HTML, harder to block ──────────
+CRICBUZZ_MOBILE = "https://m.cricbuzz.com"
+
+# Mobile browser headers — Cricbuzz mobile site doesn't block these
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.espncricinfo.com/",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
 # ── Cache ─────────────────────────────────────────────────────────────
 cache = {}
-CACHE_TTL = 20
+CACHE_TTL = 15
 
 def is_fresh(key):
-    if key not in cache: return False
-    return (datetime.now() - cache[key]["t"]).seconds < CACHE_TTL
+    return key in cache and (datetime.now() - cache[key]["t"]).seconds < CACHE_TTL
 
 def set_cache(key, data):
     cache[key] = {"data": data, "t": datetime.now()}
 
 def get_cache(key):
-    return cache.get(key, {}).get("data")
+    return cache[key]["data"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -46,16 +48,13 @@ def get_cache(key):
 async def root():
     return {
         "name": "CricScore API",
-        "version": "3.0.0",
-        "status": "running",
+        "version": "4.0.0",
+        "source": "Cricbuzz",
         "endpoints": [
-            "GET /live",
-            "GET /matches",
-            "GET /scorecard/{match_id}",
-            "GET /player/{player_id}",
-            "GET /rankings",
-            "GET /news",
-            "GET /health"
+            "GET /live       — All live matches",
+            "GET /matches    — All matches",
+            "GET /scorecard/{match_id}  — Full scorecard",
+            "GET /health     — Health check"
         ]
     }
 
@@ -65,231 +64,120 @@ async def health():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# LIVE MATCHES — from ESPNCricinfo live scores page
+# LIVE MATCHES
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/live")
 async def get_live():
-    """Scrapes ESPNCricinfo live scores page"""
     if is_fresh("live"):
         return get_cache("live")
     try:
-        matches = await fetch_espn_matches(live_only=True)
+        matches = await scrape_cricbuzz_matches(live_only=True)
         result = {"status": "success", "count": len(matches), "data": matches}
         set_cache("live", result)
         return result
     except Exception as e:
-        raise HTTPException(500, f"Error fetching live matches: {str(e)}")
+        raise HTTPException(500, str(e))
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# ALL MATCHES
-# ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/matches")
-async def get_matches():
-    """Returns all matches — live, upcoming, finished"""
-    if is_fresh("all_matches"):
-        return get_cache("all_matches")
+async def get_all_matches():
+    if is_fresh("all"):
+        return get_cache("all")
     try:
-        matches = await fetch_espn_matches(live_only=False)
+        matches = await scrape_cricbuzz_matches(live_only=False)
         result = {"status": "success", "count": len(matches), "data": matches}
-        set_cache("all_matches", result)
+        set_cache("all", result)
         return result
     except Exception as e:
-        raise HTTPException(500, f"Error fetching matches: {str(e)}")
+        raise HTTPException(500, str(e))
 
 
-async def fetch_espn_matches(live_only: bool) -> list:
-    """Fetches match data from ESPNCricinfo JSON API"""
+async def scrape_cricbuzz_matches(live_only: bool) -> list:
     matches = []
 
-    try:
-        # ESPNCricinfo has a reliable JSON endpoint for live cricket
-        url = "https://www.espncricinfo.com/ci/engine/match/index.json"
-        async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as c:
-            r = await c.get(url)
-            if r.status_code == 200:
-                data = r.json()
-                matches = parse_espn_match_index(data, live_only)
-    except Exception:
-        pass
+    url = f"{CRICBUZZ_MOBILE}/cricket-match/live-scores" if live_only else f"{CRICBUZZ_MOBILE}/cricket-schedule/upcoming-series/international"
 
-    # Fallback — try the match API directly
-    if not matches:
+    async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as c:
+        resp = await c.get(url)
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Cricbuzz mobile wraps each match in a div with class "cb-mtch-lst"
+    match_items = soup.find_all("div", class_=re.compile(r"cb-mtch-lst|cb-lv-scrs-well"))
+
+    for item in match_items:
         try:
-            url = "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/current?lang=en&latest=true"
-            async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as c:
-                r = await c.get(url)
-                if r.status_code == 200:
-                    data = r.json()
-                    matches = parse_hs_matches(data, live_only)
-        except Exception:
-            pass
-
-    # Last fallback — scrape the live scores page
-    if not matches:
-        try:
-            url = "https://www.espncricinfo.com/live-cricket-score"
-            async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as c:
-                r = await c.get(url)
-                soup = BeautifulSoup(r.text, "html.parser")
-
-            # Look for JSON data embedded in the page
-            scripts = soup.find_all("script")
-            for script in scripts:
-                txt = script.string or ""
-                if "matchInfo" in txt or "liveMatch" in txt:
-                    json_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', txt, re.S)
-                    if json_match:
-                        try:
-                            state = json.loads(json_match.group(1))
-                            matches = parse_initial_state(state, live_only)
-                            break
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-
-    return matches
-
-
-def parse_espn_match_index(data: dict, live_only: bool) -> list:
-    matches = []
-    try:
-        for match in data.get("match", []):
-            state = match.get("match_status", "").lower()
-            ms = "live" if state == "live" else ("result" if state in ["complete", "finished"] else "fixture")
-            if live_only and ms != "live":
+            # Match link
+            link = item.find("a", href=re.compile(r"/cricket-scores/"))
+            if not link:
+                link = item.find("a", href=re.compile(r"/live-cricket-scores/"))
+            if not link:
                 continue
 
-            t1 = match.get("team1_name", "")
-            t2 = match.get("team2_name", "")
-            t1s = match.get("team1_short", t1[:3].upper() if t1 else "")
-            t2s = match.get("team2_short", t2[:3].upper() if t2 else "")
+            href      = link.get("href", "")
+            match_id  = re.search(r"/(\d+)/", href)
+            mid       = match_id.group(1) if match_id else href
+
+            # Match title (team names)
+            title_el  = item.find(class_=re.compile(r"cb-lv-scrs-well-live|cb-hmscg-bat-txt|cb-lv-scr-mtch-name"))
+            title     = title_el.get_text(strip=True) if title_el else link.get_text(strip=True)
+
+            # Series name
+            series_el = item.find(class_=re.compile(r"text-gray|cb-lv-scrs-well-top"))
+            series    = series_el.get_text(strip=True) if series_el else ""
+
+            # Scores
+            score_els = item.find_all(class_=re.compile(r"cb-lv-scrs-well-live|cb-scrs-wrp|cb-hmscg-scr"))
+            score_text = " ".join([s.get_text(strip=True) for s in score_els])
+
+            # Status
+            status_el = item.find(class_=re.compile(r"cb-lv-scrs-col|cb-text-complete|cb-text-live|cb-text-preview"))
+            status    = status_el.get_text(strip=True) if status_el else ""
+
+            # Match state
+            is_live   = bool(item.find(class_=re.compile(r"cb-text-live|cb-lv-img-cont")))
+            ms        = "live" if is_live else ("result" if any(w in status.lower() for w in ["won", "draw", "tied", "no result"]) else "fixture")
+
+            # Extract teams from title
+            teams     = [t.strip() for t in re.split(r"\s+vs\.?\s+|\s+v\.?\s+", title, flags=re.I)][:2]
+            if len(teams) < 2:
+                teams = [title, ""]
+
+            t1, t2    = teams[0], teams[1] if len(teams) > 1 else ""
+            t1s       = abbreviate(t1)
+            t2s       = abbreviate(t2)
+
+            # Parse scores from score_text
+            scores    = parse_score_text(score_text, t1s, t2s)
+
+            # Match type
+            mt = "T20"
+            for fmt in ["Test", "ODI", "T20I", "T20"]:
+                if fmt.lower() in (series + title).lower():
+                    mt = fmt
+                    break
 
             matches.append({
-                "id": str(match.get("match_id", "")),
-                "name": f"{t1} vs {t2}",
-                "status": match.get("status_text", ""),
-                "venue": match.get("ground_name", ""),
-                "date": match.get("start_date", ""),
-                "matchType": match.get("match_type_text", "T20").upper(),
-                "ms": ms,
-                "teams": [t1, t2],
+                "id":       mid,
+                "name":     title,
+                "status":   status,
+                "venue":    "",
+                "date":     "",
+                "matchType": mt,
+                "ms":       ms,
+                "teams":    [t1, t2],
                 "teamInfo": [
-                    {"name": t1, "shortname": t1s, "img": get_team_flag_url(t1s)},
-                    {"name": t2, "shortname": t2s, "img": get_team_flag_url(t2s)},
+                    {"name": t1, "shortname": t1s, "img": get_flag(t1s)},
+                    {"name": t2, "shortname": t2s, "img": get_flag(t2s)},
                 ],
-                "score": parse_match_scores(match)
+                "score": scores,
+                "scorecard_url": f"/scorecard/{mid}"
             })
-    except Exception:
-        pass
+
+        except Exception:
+            continue
+
     return matches
-
-
-def parse_hs_matches(data: dict, live_only: bool) -> list:
-    matches = []
-    try:
-        for content in data.get("content", []):
-            for match in content.get("matches", []):
-                info   = match.get("matchInfo", {})
-                score  = match.get("matchScore", {})
-                status = info.get("state", "preview")
-
-                ms = "live" if status == "live" else ("result" if status == "complete" else "fixture")
-                if live_only and ms != "live":
-                    continue
-
-                t1_info = info.get("team1", {})
-                t2_info = info.get("team2", {})
-                t1  = t1_info.get("teamName", "")
-                t2  = t2_info.get("teamName", "")
-                t1s = t1_info.get("teamSName", t1[:3].upper())
-                t2s = t2_info.get("teamSName", t2[:3].upper())
-
-                # Scores
-                scores = []
-                for inn_key in ["team1Score", "team2Score"]:
-                    inn = score.get(inn_key, {})
-                    if inn:
-                        for inning in inn.values():
-                            if isinstance(inning, dict):
-                                scores.append({
-                                    "r": inning.get("runs", 0),
-                                    "w": inning.get("wickets", 0),
-                                    "o": inning.get("overs", 0.0),
-                                    "inning": inn_key.replace("Score", "")
-                                })
-
-                matches.append({
-                    "id": str(info.get("matchId", "")),
-                    "name": f"{t1} vs {t2}",
-                    "status": info.get("status", ""),
-                    "venue": info.get("ground", {}).get("longName", ""),
-                    "date": info.get("startDate", ""),
-                    "matchType": info.get("matchFormat", "T20").upper(),
-                    "ms": ms,
-                    "teams": [t1, t2],
-                    "teamInfo": [
-                        {"name": t1, "shortname": t1s, "img": get_team_flag_url(t1s)},
-                        {"name": t2, "shortname": t2s, "img": get_team_flag_url(t2s)},
-                    ],
-                    "score": scores
-                })
-    except Exception:
-        pass
-    return matches
-
-
-def parse_initial_state(state: dict, live_only: bool) -> list:
-    matches = []
-    try:
-        # Navigate the state tree
-        for key, val in state.items():
-            if isinstance(val, dict):
-                for mkey, mval in val.items():
-                    if isinstance(mval, list):
-                        for item in mval:
-                            if isinstance(item, dict) and "matchInfo" in item:
-                                info = item["matchInfo"]
-                                ms   = "live" if info.get("state") == "live" else "fixture"
-                                if live_only and ms != "live":
-                                    continue
-                                t1 = info.get("team1", {}).get("teamName", "")
-                                t2 = info.get("team2", {}).get("teamName", "")
-                                matches.append({
-                                    "id": str(info.get("matchId", "")),
-                                    "name": f"{t1} vs {t2}",
-                                    "status": info.get("status", ""),
-                                    "venue": "",
-                                    "date": "",
-                                    "matchType": info.get("matchFormat", "T20").upper(),
-                                    "ms": ms,
-                                    "teams": [t1, t2],
-                                    "teamInfo": [
-                                        {"name": t1, "shortname": t1[:3].upper(), "img": get_team_flag_url(t1[:3].upper())},
-                                        {"name": t2, "shortname": t2[:3].upper(), "img": get_team_flag_url(t2[:3].upper())},
-                                    ],
-                                    "score": []
-                                })
-    except Exception:
-        pass
-    return matches
-
-
-def parse_match_scores(match: dict) -> list:
-    scores = []
-    try:
-        for i in [1, 2]:
-            runs   = match.get(f"team{i}_score", 0) or 0
-            wickets = match.get(f"team{i}_wickets", 0) or 0
-            overs   = match.get(f"team{i}_overs", 0.0) or 0.0
-            if runs:
-                scores.append({"r": int(runs), "w": int(wickets), "o": float(overs), "inning": f"Team{i} Inning 1"})
-    except Exception:
-        pass
-    return scores
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -302,148 +190,77 @@ async def get_scorecard(match_id: str):
     if is_fresh(key):
         return get_cache(key)
     try:
-        url = f"https://hs-consumer-api.espncricinfo.com/v1/pages/match/scorecard?lang=en&seriesId=0&matchId={match_id}"
+        url = f"{CRICBUZZ_MOBILE}/cricket-scores/{match_id}"
         async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as c:
-            r = await c.get(url)
-            data = r.json()
+            resp = await c.get(url)
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-        scorecard = parse_scorecard_data(data)
-        result = {"status": "success", "data": scorecard}
+        scorecard = parse_scorecard_page(soup)
+        result    = {"status": "success", "data": scorecard}
         set_cache(key, result)
         return result
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
-def parse_scorecard_data(data: dict) -> dict:
-    scorecard = {"batting": [], "bowling": [], "teamInfo": [], "score": [], "status": "", "venue": ""}
+def parse_scorecard_page(soup: BeautifulSoup) -> dict:
+    sc = {"batting": [], "bowling": [], "status": "", "venue": ""}
     try:
-        match_info = data.get("match", {}).get("info", {})
-        scorecard["status"] = match_info.get("status", "")
-        scorecard["venue"]  = match_info.get("ground", {}).get("longName", "")
+        # Status
+        status_el = soup.find(class_=re.compile(r"cb-text-complete|cb-text-live"))
+        if status_el:
+            sc["status"] = status_el.get_text(strip=True)
 
-        for inning in data.get("scorecard", []):
-            bat_team = inning.get("inningBatTeam", {})
-            # Batting
-            for batter in inning.get("inningBatsmen", []):
-                athlete = batter.get("player", {})
-                scorecard["batting"].append({
-                    "batsman":   athlete.get("longName", athlete.get("name", "")),
-                    "player_id": str(athlete.get("id", "")),
-                    "r":         batter.get("runs", 0),
-                    "b":         batter.get("balls", 0),
-                    "4s":        batter.get("fours", 0),
-                    "6s":        batter.get("sixes", 0),
-                    "sr":        str(batter.get("strikerate", "0")),
-                    "out-desc":  batter.get("dismissal", "")
-                })
-            # Bowling
-            for bowler in inning.get("inningBowlers", []):
-                athlete = bowler.get("player", {})
-                scorecard["bowling"].append({
-                    "bowler":    athlete.get("longName", athlete.get("name", "")),
-                    "player_id": str(athlete.get("id", "")),
-                    "o":         str(bowler.get("overs", "0")),
-                    "m":         bowler.get("maidens", 0),
-                    "r":         bowler.get("runs", 0),
-                    "w":         bowler.get("wickets", 0),
-                    "eco":       str(bowler.get("economy", "0"))
-                })
+        # Batting rows
+        for row in soup.find_all("div", class_=re.compile(r"cb-col cb-col-100 cb-ltst-wgt-hdr")):
+            cols = row.find_all("div", class_=re.compile(r"cb-col"))
+            if len(cols) >= 5:
+                name_el = cols[0].find("a")
+                name    = name_el.get_text(strip=True) if name_el else cols[0].get_text(strip=True)
+                pid     = ""
+                if name_el:
+                    pid_m = re.search(r"/(\d+)/", name_el.get("href", ""))
+                    pid   = pid_m.group(1) if pid_m else ""
+                try:
+                    sc["batting"].append({
+                        "batsman":   name,
+                        "player_id": pid,
+                        "r":         int(cols[1].get_text(strip=True) or 0),
+                        "b":         int(cols[2].get_text(strip=True) or 0),
+                        "4s":        int(cols[3].get_text(strip=True) or 0),
+                        "6s":        int(cols[4].get_text(strip=True) or 0),
+                        "sr":        cols[5].get_text(strip=True) if len(cols) > 5 else "0",
+                        "out-desc":  ""
+                    })
+                except (ValueError, IndexError):
+                    continue
+
+        # Bowling rows
+        for row in soup.find_all("div", class_=re.compile(r"cb-col cb-col-100 cb-ltst-wgt-hdr")):
+            cols = row.find_all("div", class_=re.compile(r"cb-col"))
+            if len(cols) >= 5:
+                name_el = cols[0].find("a")
+                name    = name_el.get_text(strip=True) if name_el else cols[0].get_text(strip=True)
+                pid     = ""
+                if name_el:
+                    pid_m = re.search(r"/(\d+)/", name_el.get("href", ""))
+                    pid   = pid_m.group(1) if pid_m else ""
+                try:
+                    sc["bowling"].append({
+                        "bowler":    name,
+                        "player_id": pid,
+                        "o":         cols[1].get_text(strip=True),
+                        "m":         int(cols[2].get_text(strip=True) or 0),
+                        "r":         int(cols[3].get_text(strip=True) or 0),
+                        "w":         int(cols[4].get_text(strip=True) or 0),
+                        "eco":       cols[5].get_text(strip=True) if len(cols) > 5 else "0"
+                    })
+                except (ValueError, IndexError):
+                    continue
+
     except Exception as e:
-        scorecard["error"] = str(e)
-    return scorecard
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# PLAYER
-# ═══════════════════════════════════════════════════════════════════════
-
-@app.get("/player/{player_id}")
-async def get_player(player_id: str):
-    key = f"pl_{player_id}"
-    if is_fresh(key):
-        return get_cache(key)
-    try:
-        url = f"https://hs-consumer-api.espncricinfo.com/v1/pages/player/home?lang=en&playerId={player_id}"
-        async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as c:
-            r = await c.get(url)
-            data = r.json()
-
-        player = parse_player_data(data)
-        result = {"status": "success", "data": player}
-        set_cache(key, result)
-        return result
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-def parse_player_data(data: dict) -> dict:
-    player = {}
-    try:
-        info = data.get("player", {})
-        player["name"]         = info.get("longName", info.get("name", ""))
-        player["dateOfBirth"]  = info.get("dateOfBirth", "")
-        player["country"]      = info.get("country", {}).get("name", "")
-        player["role"]         = info.get("playingRole", "")
-        player["battingStyle"] = info.get("battingStyle", "")
-        player["bowlingStyle"] = info.get("bowlingStyle", "")
-        player["playerImg"]    = info.get("imageUrl", "")
-
-        stats = []
-        for stat_group in data.get("stats", []):
-            fmt       = stat_group.get("heading", "")
-            stat_type = "batting" if "bat" in fmt.lower() else "bowling"
-            stat_map  = {}
-            for row in stat_group.get("stats", []):
-                stat_map[row.get("name", "")] = row.get("value", "")
-            if stat_map:
-                stats.append({"fn": fmt, "type": stat_type, "stat": stat_map})
-
-        player["stats"] = stats
-    except Exception as e:
-        player["error"] = str(e)
-    return player
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# RANKINGS
-# ═══════════════════════════════════════════════════════════════════════
-
-@app.get("/rankings")
-async def get_rankings(type: str = "batting", format: str = "t20"):
-    key = f"rank_{type}_{format}"
-    if is_fresh(key):
-        return get_cache(key)
-    try:
-        type_map   = {"batting": "batting", "bowling": "bowling", "teams": "team", "allrounders": "all-rounder"}
-        format_map = {"t20": "T20I", "odi": "ODI", "test": "Test"}
-        t = type_map.get(type.lower(), "batting")
-        f = format_map.get(format.lower(), "T20I")
-
-        url = f"https://hs-consumer-api.espncricinfo.com/v1/pages/rankings/table?lang=en&type={t}&format={f}"
-        async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as c:
-            r = await c.get(url)
-            data = r.json()
-
-        rankings = []
-        for entry in data.get("rankings", []):
-            player  = entry.get("player", entry.get("team", {}))
-            country = player.get("country", {})
-            rankings.append({
-                "rank":    str(entry.get("rank", "")),
-                "name":    player.get("longName", player.get("name", "")),
-                "country": country.get("abbreviation", country.get("name", "")),
-                "rating":  str(entry.get("rating", "")),
-                "points":  str(entry.get("points", ""))
-            })
-
-        result = {"status": "success", "data": rankings}
-        set_cache(key, result)
-        return result
-    except Exception as e:
-        # Return fallback rankings
-        result = {"status": "success", "data": fallback_rankings(type)}
-        return result
+        sc["error"] = str(e)
+    return sc
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -455,21 +272,31 @@ async def get_news():
     if is_fresh("news"):
         return get_cache("news")
     try:
-        url = "https://hs-consumer-api.espncricinfo.com/v1/pages/home/news?lang=en&limit=20"
         async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as c:
-            r = await c.get(url)
-            data = r.json()
+            resp = await c.get(f"{CRICBUZZ_MOBILE}/cricket-news")
+            soup = BeautifulSoup(resp.text, "html.parser")
 
         news = []
-        for item in data.get("results", data.get("stories", [])):
-            news.append({
-                "id":       str(item.get("id", "")),
-                "title":    item.get("headline", item.get("title", "")),
-                "intro":    item.get("description", item.get("summary", "")),
-                "date":     item.get("publishedAt", item.get("date", "")),
-                "imageUrl": item.get("imageUrl", ""),
-                "source":   "ESPNCricinfo"
-            })
+        for item in soup.find_all("div", class_=re.compile(r"cb-nws-lst-itm|cb-lst-itm")):
+            try:
+                a   = item.find("a")
+                if not a: continue
+                title = a.get_text(strip=True)
+                intro_el = item.find(class_=re.compile(r"cb-nws-intr"))
+                intro = intro_el.get_text(strip=True) if intro_el else ""
+                date_el = item.find(class_=re.compile(r"cb-nws-time|text-gray"))
+                date  = date_el.get_text(strip=True) if date_el else ""
+                if title:
+                    news.append({
+                        "id": a.get("href", ""),
+                        "title": title,
+                        "intro": intro,
+                        "date": date,
+                        "imageUrl": "",
+                        "source": "Cricbuzz"
+                    })
+            except Exception:
+                continue
 
         result = {"status": "success", "count": len(news), "data": news}
         set_cache("news", result)
@@ -479,10 +306,55 @@ async def get_news():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# RANKINGS (fallback data — reliable)
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.get("/rankings")
+async def get_rankings(type: str = "batting", format: str = "t20"):
+    return {"status": "success", "data": fallback_rankings(type)}
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════
 
-def get_team_flag_url(short: str) -> str:
+def parse_score_text(text: str, t1: str, t2: str) -> list:
+    scores = []
+    # Match patterns like "274/10 (47.3 ov)" or "114-10 (23.3)"
+    patterns = re.findall(r'(\d{1,3})[/\-](\d{1,2})\s*\(?(\d{1,2}\.?\d?)', text)
+    teams = [t1, t2]
+    for i, (runs, wkts, overs) in enumerate(patterns[:2]):
+        scores.append({
+            "r": int(runs),
+            "w": int(wkts),
+            "o": float(overs) if overs else 0.0,
+            "inning": f"{teams[i] if i < len(teams) else 'Team'} Inning 1"
+        })
+    return scores
+
+
+def abbreviate(name: str) -> str:
+    """Convert full team name to 2-3 letter abbreviation"""
+    known = {
+        "india": "IND", "england": "ENG", "australia": "AUS",
+        "pakistan": "PAK", "south africa": "SA", "new zealand": "NZ",
+        "west indies": "WI", "sri lanka": "SL", "bangladesh": "BAN",
+        "afghanistan": "AFG", "zimbabwe": "ZIM", "ireland": "IRE",
+        "scotland": "SCO", "namibia": "NAM", "netherlands": "NED",
+        "usa": "USA", "united states": "USA", "kenya": "KEN",
+    }
+    lower = name.lower().strip()
+    for k, v in known.items():
+        if k in lower:
+            return v
+    # Fallback: first 3 chars uppercase
+    words = name.strip().split()
+    if len(words) >= 2:
+        return "".join(w[0] for w in words[:3]).upper()
+    return name[:3].upper()
+
+
+def get_flag(short: str) -> str:
     flags = {
         "IND": "https://cricketvectors.akamaized.net/Teams/I.png",
         "ENG": "https://cricketvectors.akamaized.net/Teams/E.png",
